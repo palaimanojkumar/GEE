@@ -1,0 +1,294 @@
+var start_yr = "2021-11-15";  //yyyy
+var end_yr = "2021-11-18";    //yyyy
+
+var landsatImg = ee.Image('LANDSAT/LC08/C02/T1_L2/LC08_131038_20211118');
+
+Map.addLayer(landsatImg);
+
+var data =imageCollection.filterBounds(roi)
+.filterDate(start_yr,end_yr)
+.select("SurfReflect_I1","SurfReflect_I2","SurfReflect_I3");
+
+print(data);
+
+var data_sf = data.map(function(img) {
+  var renamedImg = img.rename(["I1", "I2", "I3"]);
+  var clip = renamedImg.clip(roi);
+  return clip.copyProperties(img, ['system:time_start']);
+});
+
+var npp_snow_mask = data_sf.map(function(img) {
+  var ndsi = img.normalizedDifference(["I1", "I3"]);
+  var ndsi_mask = ndsi.gt(0.4);
+  
+  var nir_mask = img.select(["I2"]).gt(0.1);
+  var swir_mask = img.select(["I3"]).lt(0.45);
+  
+  var swi = img.normalizedDifference(["I2", "I3"]).multiply(
+    img.select(["I1"]).divide(
+      img.select(["I1"]).add(img.select(["I2"]))
+    )
+  ).where(
+    img.normalizedDifference(["I2", "I3"]).multiply(
+      img.select(["I1"]).divide(
+        img.select(["I1"]).add(img.select(["I2"]))
+      )
+    ).gt(0.21), 1
+  ).where(
+    img.normalizedDifference(["I2", "I3"]).multiply(
+      img.select(["I1"]).divide(
+        img.select(["I1"]).add(img.select(["I2"]))
+      )
+    ).lte(0.21), 0
+  );
+  
+  var mask = ndsi_mask.and(nir_mask).and(swir_mask).and(swi);
+  var snow_mask = mask.where(mask.gt(1), 1).where(mask.lte(0), 0);
+  return snow_mask.rename('npp_snw_mask');
+});
+
+//Map.addLayer(npp_snow_mask, {}, "NPP Snow Mask", true);
+
+// Function to classify snow in Landsat
+function classifySnowLandsat(image) {
+  var ndsi = image.normalizedDifference(['SR_B3', 'SR_B6']).rename('ndsi');
+  var mask = ndsi.gt(0.4).and(image.select('SR_B5').gt(0.1));
+  var snow_mask = mask.where(mask.gt(1), 1).where(mask.lte(0), 0);
+  return snow_mask.rename('landsat_snow_mask');
+}
+
+
+//var landsatImg = ee.Image('LANDSAT/LC09/C02/T1_L2/LC09_141040_20221205');
+var landsatSnow = classifySnowLandsat(landsatImg);
+
+//Map.addLayer(landsatSnow, {palette: ['FF0000'], opacity: 0.5}, "Landsat Snow Mask", true);
+
+// Get the Landsat footprint
+var landsatFootprint = landsatImg.geometry();
+
+// Clip the Landsat snow mask to its own footprint (optional, ensures consistency)
+var landsatSnowClipped = landsatSnow.clip(landsatFootprint);
+
+var landsatProjection = landsatImg.projection();
+
+//print(landsatProjection);
+
+// Reproject NPP image to match Landsat's projection and resolution
+var nppResampledclipped = npp_snow_mask.map(function(img) {
+  return img.reproject({
+    crs: landsatProjection,
+    scale: landsatProjection.nominalScale()
+  }).clip(landsatFootprint);  // Ensure clipping after reprojection
+});
+
+// Clip both masks to this common extent
+var landsatSnowClipped = landsatSnow.clip(landsatFootprint);
+
+//print('Landsat Projection:', landsatProjection);
+//print('NPP Projection:', nppResampledclipped.first().projection());
+
+
+// Ensure that groundTruth and prediction are images
+var groundTruth = landsatSnowClipped;
+
+// If nppResampledClipped is an image collection, reduce it to a single image
+var prediction = nppResampledclipped.first(); // You can change this reduction method as needed
+
+// Print ground truth and prediction masks to inspect
+//print("Ground Truth Mask", groundTruth);
+//print("Prediction Mask", prediction);
+
+// Visualize masks to check correctness
+//Map.addLayer(groundTruth, {}, "Ground Truth Mask");
+//Map.addLayer(prediction, {}, "Prediction Mask");
+
+var tpMask = groundTruth.and(prediction).rename('tp');
+var tnMask = groundTruth.not().and(prediction.not());
+var fpMask = groundTruth.not().and(prediction);
+var fnMask = groundTruth.and(prediction.not());
+
+var tpmask = tpMask.eq(1).rename('tp');
+var tnmask = tnMask.eq(1).rename('tn');
+var fpmask = fpMask.eq(1).rename('fp');
+var fnmask = fnMask.eq(1).rename('fn');
+
+var tp = tpmask.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: landsatFootprint,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('tp');  // Use 'tp' as the key
+
+tp = ee.Number(tp);
+//print('True Positives (TP):', tp);
+
+var tn = tnmask.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: landsatFootprint,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('tn');
+
+tn = ee.Number(tn);
+//print('True Negatives (TN):', tn);
+
+var fp = fpmask.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: landsatFootprint,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('fp');
+
+fp = ee.Number(fp);
+//print('False Positives (FP):', fp);
+
+var fn = fnmask.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: landsatFootprint,
+    scale: 30,
+    maxPixels: 1e9
+  }).get('fn');
+
+fn = ee.Number(fn);
+//print('False Negatives (FN):', fn);
+
+// Create the confusion matrix
+var confusionMatrix = ee.Array([
+  [tp, fn], // Row for actual positives (TP, FN)
+  [fp, tn]  // Row for actual negatives (FP, TN)
+]);
+
+//print('Confusion Matrix:', confusionMatrix);
+
+// Calculate accuracy metrics
+var total = tp.add(tn).add(fp).add(fn);
+var overallAccuracy = tp.add(tn).divide(total);
+var precision = tp.divide(tp.add(fp));
+var recall = tp.divide(tp.add(fn));
+var f1Score = precision.multiply(recall).multiply(2).divide(precision.add(recall));
+
+print('Overall Accuracy:', overallAccuracy);
+print('Precision:', precision);
+print('Recall:', recall);
+print('F1 Score:', f1Score);
+
+// Calculate Kappa coefficient
+var observedAccuracy = overallAccuracy;
+var expectedAccuracy = tp.add(fp).multiply(tp.add(fn)).add(fn.add(tn).multiply(fp.add(tn))).divide(total.multiply(total));
+
+var kappa = observedAccuracy.subtract(expectedAccuracy).divide(ee.Number(1).subtract(expectedAccuracy));
+print('Kappa Coefficient:', kappa);
+
+// Compute the fractional snow-covered area for ground truth
+function computeFractionalSnowCoverLandsat(snowMask, footprint, scale) {
+  // Calculate the number of snow pixels (where snow mask == 1)
+  var snowPixels = snowMask.eq(1).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: footprint,
+    scale: scale,
+    maxPixels: 1e9
+  }).get('landsat_snow_mask'); // Change this key based on the input snow mask name
+
+  snowPixels = ee.Number(snowPixels);
+
+  // Calculate the total number of pixels in the footprint
+  var totalPixels = snowMask.unmask(0).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: footprint,
+    scale: scale,
+    maxPixels: 1e9
+  }).get('landsat_snow_mask');
+
+  totalPixels = ee.Number(totalPixels);
+
+  // Compute fractional snow cover area
+  var fractionalSnowCover = snowPixels.divide(totalPixels);
+
+  return fractionalSnowCover;
+}
+
+// Compute the fractional snow-covered area for predicted masks
+function computeFractionalSnowCoverNPP(snowMask, footprint, scale) {
+  // Calculate the number of snow pixels (where snow mask == 1)
+  var snowPixels = snowMask.eq(1).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: footprint,
+    scale: scale,
+    maxPixels: 1e9
+  }).get('npp_snw_mask'); // Change this key based on the input snow mask name
+
+  snowPixels = ee.Number(snowPixels);
+
+  // Calculate the total number of pixels in the footprint
+  var totalPixels = snowMask.unmask(0).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: footprint,
+    scale: scale,
+    maxPixels: 1e9
+  }).get('npp_snw_mask');
+
+  totalPixels = ee.Number(totalPixels);
+
+  // Compute fractional snow cover area
+  var fractionalSnowCover = snowPixels.divide(totalPixels);
+
+  return fractionalSnowCover;
+}
+
+// Compute fractional snow cover for Landsat (ground truth)
+var fractionalLandsatSnowCover = computeFractionalSnowCoverLandsat(landsatSnowClipped, landsatFootprint, 30);
+print('Fractional Snow Cover (Landsat):', fractionalLandsatSnowCover);
+
+// Compute fractional snow cover for NPP (predicted)
+var fractionalNPPSnowCover = computeFractionalSnowCoverNPP(prediction, landsatFootprint, 30);
+print('Fractional Snow Cover (NPP):', fractionalNPPSnowCover);
+
+
+
+// // Print confusion matrix in readable format
+// print('Confusion Matrix (Readable):', ee.Dictionary({
+//   'True Positive (TP)': tp,
+//   'False Negative (FN)': fn,
+//   'False Positive (FP)': fp,
+//   'True Negative (TN)': tn
+// }));
+
+
+
+///////////exporting images////////////////////
+
+// Export.image.toDrive({image:tpMask, 
+//                       description:"vnp_validation", 
+//                       folder: 'validation', 
+//                       fileNamePrefix: "tpmask",
+//                       region:landsatFootprint, 
+//                       scale: 30,
+//                       maxPixels: 1e13,
+//                       fileFormat: 'GeoTIFF'});
+
+// Export.image.toDrive({image:tnMask, 
+//                       description:"vnp_validation", 
+//                       folder: 'validation', 
+//                       fileNamePrefix: "tnmask",
+//                       region:landsatFootprint, 
+//                       scale: 30,
+//                       maxPixels: 1e13,
+//                       fileFormat: 'GeoTIFF'});
+                      
+// Export.image.toDrive({image:fpMask, 
+//                       description:"vnp_validation", 
+//                       folder: 'validation', 
+//                       fileNamePrefix: "fpmask",
+//                       region:landsatFootprint, 
+//                       scale: 30,
+//                       maxPixels: 1e13,
+//                       fileFormat: 'GeoTIFF'});
+
+// Export.image.toDrive({image:fnMask, 
+//                       description:"vnp_validation", 
+//                       folder: 'validation', 
+//                       fileNamePrefix: "fnmask",
+//                       region:landsatFootprint, 
+//                       scale: 30,
+//                       maxPixels: 1e13,
+//                       fileFormat: 'GeoTIFF'});                      
