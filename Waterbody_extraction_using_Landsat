@@ -1,0 +1,66 @@
+var aoi = basin;
+Map.addLayer(aoi);
+Map.centerObject(aoi,8);
+
+var startDate = '2024';   //1998,2008,2018,2024
+var endDate = '2025';
+var cloudThreshold = 10;
+
+var landsat5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+    .filterBounds(aoi)                       // Filter by region of interest
+    .filterDate(startDate, endDate)          // Filter by date range
+    .filter(ee.Filter.lte('CLOUD_COVER', cloudThreshold))
+    .filter(ee.Filter.calendarRange(1, 12, 'month'));// Landsat 8 SR Collection
+    
+print(landsat5);
+
+var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(aoi)                       // Filter by region of interest
+    .filterDate(startDate, endDate)          // Filter by date range
+    .filter(ee.Filter.lte('CLOUD_COVER', cloudThreshold))
+    .filter(ee.Filter.calendarRange(6,10, 'month'));// Landsat 8 SR Collection
+    
+print(landsat8);
+
+var landsat9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+    .filterBounds(aoi)                       // Filter by region of interest
+    .filterDate(startDate, endDate)          // Filter by date range
+    .filter(ee.Filter.lte('CLOUD_COVER', cloudThreshold))
+    .filter(ee.Filter.calendarRange(1,12, 'month'));// Landsat 8 SR Collection
+    
+print(landsat9);
+
+//Map.addLayer(landsat5);
+
+function classifywaterLandsat5(image) {
+  var ms = image.select("SR.*");
+  var gain = ee.Image.constant(image.get('REFLECTANCE_MULT_BAND_3'));
+  var offset = ee.Image.constant(image.get('REFLECTANCE_ADD_BAND_2'));
+  var sr = ms.multiply(gain).add(offset);
+  var mNDWI = sr.normalizedDifference(['SR_B2', 'SR_B5']).rename('Mndwi');
+  //var mask = ndsi.gt(0.4).and(sr.select('SR_B4').gt(0.1));  // NDSI > 0.4 and NIR (B5) > 0.1
+  //var snow_mask = mask.updateMask(mask).rename('landsat_snow_mask');  // Ensure snow_mask is an ee.Image with valid mask
+  return mNDWI.copyProperties(image, ['system:time_start']);
+  //return snow_mask.copyProperties(image, ['system:time_start']);
+}
+
+function classifywaterLandsat8_9(image) {
+  var ms = image.select("SR.*");
+  var gain = ee.Image.constant(image.get('REFLECTANCE_MULT_BAND_3'));
+  var offset = ee.Image.constant(image.get('REFLECTANCE_ADD_BAND_2'));
+  var sr = ms.multiply(gain).add(offset);
+  var mNDWI = sr.normalizedDifference(['SR_B3', 'SR_B6']).gte(0).rename('Mndwi');
+  //var mask = ndsi.gt(0.4).and(sr.select('SR_B4').gt(0.1));  // NDSI > 0.4 and NIR (B5) > 0.1
+  //var snow_mask = mask.updateMask(mask).rename('landsat_snow_mask');  // Ensure snow_mask is an ee.Image with valid mask
+  return mNDWI.copyProperties(image, ['system:time_start']);
+  //return snow_mask.copyProperties(image, ['system:time_start']);
+}
+
+// Apply NDWI function
+var Landsat_8_9 = landsat8.merge(landsat9).map(classifywaterLandsat8_9);
+
+// Create a median composite
+var ndwi_mosaic = Landsat_8_9.median().clip(aoi);
+
+// Visualize
+Map.addLayer(ndwi_mosaic, {min: 0, max: 1, palette: ['white','blue']}, 'NDWI (Median)');
